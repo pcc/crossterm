@@ -9,7 +9,7 @@ use libc::{
     cfmakeraw, ioctl, tcgetattr, tcsetattr, termios as Termios, winsize, STDOUT_FILENO, TCSANOW,
     TIOCGWINSZ,
 };
-use parking_lot::Mutex;
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 #[cfg(not(feature = "libc"))]
 use rustix::{
     fd::AsFd,
@@ -23,12 +23,30 @@ use std::{
     os::unix::io::{IntoRawFd, RawFd},
 };
 
+pub struct UnixTerminal<'a> {
+    fd: FileDesc<'a>,
+    prior_mode: Option<Termios>,
+}
+
+static TERMINAL: Mutex<Option<UnixTerminal<'static>>> = parking_lot::const_mutex(None);
+
+pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, UnixTerminal<'static>>> {
+    let mut terminal = TERMINAL.lock();
+    if terminal.is_none() {
+        *terminal = Some(UnixTerminal::<'static> {
+            fd: tty_fd()?,
+            prior_mode: None,
+        });
+    }
+    Ok(MutexGuard::map(terminal, |t| t.as_mut().unwrap()))
+}
+
 // Some(Termios) -> we're in the raw mode and this is the previous mode
 // None -> we're not in the raw mode
 static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const_mutex(None);
 
 pub(crate) fn is_raw_mode_enabled() -> bool {
-    TERMINAL_MODE_PRIOR_RAW_MODE.lock().is_some()
+    TERMINAL.lock().as_mut().is_some_and(|t| t.prior_mode.is_some())
 }
 
 #[cfg(feature = "libc")]
@@ -122,18 +140,17 @@ pub(crate) fn enable_raw_mode() -> io::Result<()> {
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn enable_raw_mode() -> io::Result<()> {
-    let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
-    if original_mode.is_some() {
+    let mut terminal = terminal()?;
+    if terminal.prior_mode.is_some() {
         return Ok(());
     }
 
-    let tty = tty_fd()?;
-    let mut ios = get_terminal_attr(&tty)?;
+    let mut ios = get_terminal_attr(&terminal.fd)?;
     let original_mode_ios = ios.clone();
     ios.make_raw();
-    set_terminal_attr(&tty, &ios)?;
+    set_terminal_attr(&terminal.fd, &ios)?;
     // Keep it last - set the original mode only if we were able to switch to the raw mode
-    *original_mode = Some(original_mode_ios);
+    terminal.prior_mode = Some(original_mode_ios);
     Ok(())
 }
 
@@ -156,12 +173,11 @@ pub(crate) fn disable_raw_mode() -> io::Result<()> {
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn disable_raw_mode() -> io::Result<()> {
-    let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
-    if let Some(original_mode_ios) = original_mode.as_ref() {
-        let tty = tty_fd()?;
-        set_terminal_attr(&tty, original_mode_ios)?;
+    let mut terminal = terminal()?;
+    if let Some(original_mode_ios) = terminal.prior_mode.as_ref() {
+        set_terminal_attr(&terminal.fd, original_mode_ios)?;
         // Keep it last - remove the original mode only if we were able to switch back
-        *original_mode = None;
+        terminal.prior_mode = None;
     }
     Ok(())
 }
