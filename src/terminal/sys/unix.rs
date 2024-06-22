@@ -1,9 +1,6 @@
 //! UNIX related logic for terminal manipulation.
 
-use crate::terminal::{
-    sys::file_descriptor::{tty_fd, FileDesc},
-    WindowSize,
-};
+use crate::terminal::WindowSize;
 #[cfg(feature = "libc")]
 use libc::{
     cfmakeraw, ioctl, tcgetattr, tcsetattr, termios as Termios, winsize, STDOUT_FILENO, TCSANOW,
@@ -23,18 +20,18 @@ use std::{
     os::unix::io::{IntoRawFd, RawFd},
 };
 
-pub struct UnixTerminal<'a> {
-    fd: FileDesc<'a>,
+pub struct Terminal {
+    file: File,
     prior_mode: Option<Termios>,
 }
 
-static TERMINAL: Mutex<Option<UnixTerminal<'static>>> = parking_lot::const_mutex(None);
+static TERMINAL: Mutex<Option<Terminal>> = parking_lot::const_mutex(None);
 
-pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, UnixTerminal<'static>>> {
+pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, Terminal>> {
     let mut terminal = TERMINAL.lock();
     if terminal.is_none() {
-        *terminal = Some(UnixTerminal::<'static> {
-            fd: tty_fd()?,
+        *terminal = Some(Terminal {
+            file: File::options().read(true).write(true).open("/dev/tty")?,
             prior_mode: None,
         });
     }
@@ -45,8 +42,14 @@ pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, UnixTerminal<'st
 // None -> we're not in the raw mode
 static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const_mutex(None);
 
+impl Terminal {
+    pub fn is_raw_mode_enabled(&self) -> bool {
+        self.prior_mode.is_some()
+    }
+}
+
 pub(crate) fn is_raw_mode_enabled() -> bool {
-    TERMINAL.lock().as_mut().is_some_and(|t| t.prior_mode.is_some())
+    TERMINAL.lock().as_ref().is_some_and(|t| t.is_raw_mode_enabled())
 }
 
 #[cfg(feature = "libc")]
@@ -100,15 +103,14 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn window_size() -> io::Result<WindowSize> {
-    let file = File::open("/dev/tty").map(|file| (FileDesc::Owned(file.into())));
-    let fd = if let Ok(file) = &file {
-        file.as_fd()
-    } else {
-        // Fallback to libc::STDOUT_FILENO if /dev/tty is missing
-        rustix::stdio::stdout()
-    };
-    let size = rustix::termios::tcgetwinsize(fd)?;
-    Ok(size.into())
+    terminal()?.window_size()
+}
+
+impl Terminal {
+    pub fn window_size(&self) -> io::Result<WindowSize> {
+        let size = rustix::termios::tcgetwinsize(&self.file)?;
+        Ok(size.into())
+    }
 }
 
 #[allow(clippy::useless_conversion)]
@@ -140,18 +142,23 @@ pub(crate) fn enable_raw_mode() -> io::Result<()> {
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn enable_raw_mode() -> io::Result<()> {
-    let mut terminal = terminal()?;
-    if terminal.prior_mode.is_some() {
-        return Ok(());
-    }
+    terminal()?.enable_raw_mode()
+}
 
-    let mut ios = get_terminal_attr(&terminal.fd)?;
-    let original_mode_ios = ios.clone();
-    ios.make_raw();
-    set_terminal_attr(&terminal.fd, &ios)?;
-    // Keep it last - set the original mode only if we were able to switch to the raw mode
-    terminal.prior_mode = Some(original_mode_ios);
-    Ok(())
+impl Terminal {
+    pub fn enable_raw_mode(&mut self) -> io::Result<()> {
+        if self.prior_mode.is_some() {
+            return Ok(());
+        }
+
+        let mut ios = get_terminal_attr(&self.file.as_fd())?;
+        let original_mode_ios = ios.clone();
+        ios.make_raw();
+        set_terminal_attr(&self.file.as_fd(), &ios)?;
+        // Keep it last - set the original mode only if we were able to switch to the raw mode
+        self.prior_mode = Some(original_mode_ios);
+        Ok(())
+    }
 }
 
 /// Reset the raw mode.
@@ -173,13 +180,18 @@ pub(crate) fn disable_raw_mode() -> io::Result<()> {
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn disable_raw_mode() -> io::Result<()> {
-    let mut terminal = terminal()?;
-    if let Some(original_mode_ios) = terminal.prior_mode.as_ref() {
-        set_terminal_attr(&terminal.fd, original_mode_ios)?;
-        // Keep it last - remove the original mode only if we were able to switch back
-        terminal.prior_mode = None;
+    terminal()?.disable_raw_mode()
+}
+
+impl Terminal {
+    pub fn disable_raw_mode(&mut self) -> io::Result<()> {
+        if let Some(original_mode_ios) = self.prior_mode.as_ref() {
+            set_terminal_attr(&self.file.as_fd(), original_mode_ios)?;
+            // Keep it last - remove the original mode only if we were able to switch back
+            self.prior_mode = None;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(not(feature = "libc"))]
@@ -200,23 +212,26 @@ fn set_terminal_attr(fd: impl AsFd, termios: &Termios) -> io::Result<()> {
 /// [`crossterm::event::read`](crate::event::read) or [`crossterm::event::poll`](crate::event::poll) are being called.
 #[cfg(feature = "events")]
 pub fn supports_keyboard_enhancement() -> io::Result<bool> {
-    if is_raw_mode_enabled() {
-        read_supports_keyboard_enhancement_raw()
+    use std::ops::DerefMut;
+
+    let mut terminal = terminal()?;
+    if terminal.is_raw_mode_enabled() {
+        read_supports_keyboard_enhancement_raw(terminal.deref_mut())
     } else {
-        read_supports_keyboard_enhancement_flags()
+        read_supports_keyboard_enhancement_flags(terminal.deref_mut())
     }
 }
 
 #[cfg(feature = "events")]
-fn read_supports_keyboard_enhancement_flags() -> io::Result<bool> {
-    enable_raw_mode()?;
-    let flags = read_supports_keyboard_enhancement_raw();
-    disable_raw_mode()?;
+fn read_supports_keyboard_enhancement_flags(terminal: &mut Terminal) -> io::Result<bool> {
+    terminal.enable_raw_mode()?;
+    let flags = read_supports_keyboard_enhancement_raw(terminal);
+    terminal.disable_raw_mode()?;
     flags
 }
 
 #[cfg(feature = "events")]
-fn read_supports_keyboard_enhancement_raw() -> io::Result<bool> {
+fn read_supports_keyboard_enhancement_raw(terminal: &mut Terminal) -> io::Result<bool> {
     use crate::event::{
         filter::{KeyboardEnhancementFlagsFilter, PrimaryDeviceAttributesFilter},
         poll_internal, read_internal, InternalEvent,
@@ -235,15 +250,8 @@ fn read_supports_keyboard_enhancement_raw() -> io::Result<bool> {
     // ESC [ c          Query primary device attributes.
     const QUERY: &[u8] = b"\x1B[?u\x1B[c";
 
-    let result = File::open("/dev/tty").and_then(|mut file| {
-        file.write_all(QUERY)?;
-        file.flush()
-    });
-    if result.is_err() {
-        let mut stdout = io::stdout();
-        stdout.write_all(QUERY)?;
-        stdout.flush()?;
-    }
+    terminal.file.write_all(QUERY)?;
+    terminal.file.flush()?;
 
     loop {
         match poll_internal(
