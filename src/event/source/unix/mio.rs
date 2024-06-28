@@ -1,6 +1,7 @@
-use std::{collections::VecDeque, io, time::Duration};
+use std::{collections::VecDeque, fs::File, io, io::Read, time::Duration};
 
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+use rustix::fd::AsRawFd;
 use signal_hook_mio::v1_0::Signals;
 
 #[cfg(feature = "event-stream")]
@@ -8,7 +9,7 @@ use crate::event::sys::Waker;
 use crate::event::{
     source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event, InternalEvent,
 };
-use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
+use crate::terminal::sys::file_descriptor::tty_file;
 
 // Tokens to identify file descriptor
 const TTY_TOKEN: Token = Token(0);
@@ -26,22 +27,28 @@ pub(crate) struct UnixInternalEventSource {
     events: Events,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
-    tty_fd: FileDesc<'static>,
+    tty: File,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
 }
 
+pub type WinchSignalReceiver = ();
+
+pub fn winch_signal_receiver() -> io::Result<WinchSignalReceiver> {
+    Ok(())
+}
+
 impl UnixInternalEventSource {
     pub fn new() -> io::Result<Self> {
-        UnixInternalEventSource::from_file_descriptor(tty_fd()?)
+        UnixInternalEventSource::from_file(tty_file()?, winch_signal_receiver()?)
     }
 
-    pub(crate) fn from_file_descriptor(input_fd: FileDesc<'static>) -> io::Result<Self> {
+    pub(crate) fn from_file(input_file: File, winch_signal_receiver: WinchSignalReceiver) -> io::Result<Self> {
         let poll = Poll::new()?;
         let registry = poll.registry();
 
-        let tty_raw_fd = input_fd.raw_fd();
+        let tty_raw_fd = input_file.as_raw_fd();
         let mut tty_ev = SourceFd(&tty_raw_fd);
         registry.register(&mut tty_ev, TTY_TOKEN, Interest::READABLE)?;
 
@@ -56,7 +63,7 @@ impl UnixInternalEventSource {
             events: Events::with_capacity(3),
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
-            tty_fd: input_fd,
+            tty: input_file,
             signals,
             #[cfg(feature = "event-stream")]
             waker,
@@ -93,7 +100,7 @@ impl EventSource for UnixInternalEventSource {
                 match token {
                     TTY_TOKEN => {
                         loop {
-                            match self.tty_fd.read(&mut self.tty_buffer) {
+                            match self.tty.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
                                     if read_count > 0 {
                                         self.parser.advance(

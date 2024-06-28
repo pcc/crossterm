@@ -100,6 +100,7 @@ pub(crate) mod sys;
 
 #[cfg(feature = "events")]
 pub use sys::supports_keyboard_enhancement;
+pub use sys::{tty_file, winch_signal_receiver};
 
 /// Tells whether the raw mode is enabled.
 ///

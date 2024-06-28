@@ -13,6 +13,7 @@ use std::{
         prelude::AsRawFd,
     },
 };
+use std::fs::File;
 
 /// A file descriptor wrapper.
 ///
@@ -139,16 +140,18 @@ pub fn tty_fd() -> io::Result<FileDesc<'static>> {
 }
 
 #[cfg(not(feature = "libc"))]
+pub fn tty_file() -> io::Result<File> {
+    File::options().read(true).write(true).open("/dev/tty")
+}
+
+#[cfg(not(feature = "libc"))]
 /// Creates a file descriptor pointing to the standard input or `/dev/tty`.
 pub fn tty_fd() -> io::Result<FileDesc<'static>> {
-    use std::fs::File;
-
     let stdin = rustix::stdio::stdin();
     let fd = if rustix::termios::isatty(stdin) {
         FileDesc::Borrowed(stdin)
     } else {
-        let dev_tty = File::options().read(true).write(true).open("/dev/tty")?;
-        FileDesc::Owned(dev_tty.into())
+        FileDesc::Owned(tty_file()?.into())
     };
     Ok(fd)
 }

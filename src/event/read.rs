@@ -1,7 +1,8 @@
-use std::{collections::vec_deque::VecDeque, io, time::Duration};
+use std::{collections::vec_deque::VecDeque, fs::File, io, time::Duration};
 
 #[cfg(unix)]
 use crate::event::source::unix::UnixInternalEventSource;
+use crate::event::source::unix::WinchSignalReceiver;
 #[cfg(windows)]
 use crate::event::source::windows::WindowsEventSource;
 #[cfg(feature = "event-stream")]
@@ -37,6 +38,18 @@ impl InternalEventReader {
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
         self.source.as_ref().expect("reader source not set").waker()
+    }
+
+    pub(crate) fn with_unix_term(file: File, winch_signal_receiver: WinchSignalReceiver) -> Self {
+        let source = UnixInternalEventSource::from_file(file, winch_signal_receiver);
+
+        let source = source.ok().map(|x| Box::new(x) as Box<dyn EventSource>);
+
+        InternalEventReader {
+            source,
+            events: VecDeque::with_capacity(32),
+            skipped_events: Vec::with_capacity(32),
+        }
     }
 
     pub(crate) fn poll<F>(&mut self, timeout: Option<Duration>, filter: &F) -> io::Result<bool>

@@ -7,6 +7,10 @@ pub use self::unix::supports_keyboard_enhancement;
 pub(crate) use self::unix::{
     disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, size, window_size,
 };
+#[cfg(unix)]
+pub use crate::terminal::sys::file_descriptor::tty_file;
+#[cfg(unix)]
+pub use crate::event::source::unix::winch_signal_receiver;
 #[cfg(windows)]
 #[cfg(feature = "events")]
 pub use self::windows::supports_keyboard_enhancement;
