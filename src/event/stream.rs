@@ -1,4 +1,5 @@
 use std::{
+    fs::File,
     io,
     pin::Pin,
     sync::{
@@ -16,6 +17,8 @@ use futures_core::stream::Stream;
 use crate::event::{
     filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
     Event, InternalEvent,
+    read::InternalEventReader,
+    source::unix::WinchSignalReceiver,
 };
 
 /// A stream of `Result<Event>`.
@@ -39,6 +42,17 @@ pub struct EventStream {
 
 impl Default for EventStream {
     fn default() -> Self {
+        EventStream::with_internal_waker(lock_internal_event_reader().waker())
+    }
+}
+
+impl EventStream {
+    /// Constructs a new instance of `EventStream`.
+    pub fn new() -> EventStream {
+        EventStream::default()
+    }
+
+    fn with_internal_waker(waker: Waker) -> Self {
         let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
 
         thread::spawn(move || {
@@ -59,18 +73,15 @@ impl Default for EventStream {
         });
 
         EventStream {
-            poll_internal_waker: lock_internal_event_reader().waker(),
+            poll_internal_waker: waker,
             stream_wake_task_executed: Arc::new(AtomicBool::new(false)),
             stream_wake_task_should_shutdown: Arc::new(AtomicBool::new(false)),
             task_sender,
         }
     }
-}
 
-impl EventStream {
-    /// Constructs a new instance of `EventStream`.
-    pub fn new() -> EventStream {
-        EventStream::default()
+    pub fn with_unix_term(file: File, winch_signal_receiver: WinchSignalReceiver) -> Self {
+        EventStream::with_internal_waker(InternalEventReader::with_unix_term(file, winch_signal_receiver).waker())
     }
 }
 

@@ -14,7 +14,7 @@ use filedescriptor::{poll, pollfd, POLLIN};
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{source::EventSource, sys::unix::parse::parse_event, InternalEvent};
-use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
+use crate::terminal::sys::file_descriptor::FileDesc;
 
 /// Holds a prototypical Waker and a receiver we can wait on when doing select().
 #[cfg(feature = "event-stream")]
@@ -42,7 +42,7 @@ const TTY_BUFFER_SIZE: usize = 1_024;
 pub(crate) struct UnixInternalEventSource {
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
-    tty: FileDesc<'static>,
+    tty: File,
     winch_signal_receiver: UnixStream,
     #[cfg(feature = "event-stream")]
     wake_pipe: WakePipe,
@@ -55,25 +55,29 @@ fn nonblocking_unix_pair() -> io::Result<(UnixStream, UnixStream)> {
     Ok((receiver, sender))
 }
 
+pub type WinchSignalReceiver = UnixStream;
+
+pub fn winch_signal_receiver() -> io::Result<WinchSignalReceiver> {
+    let (receiver, sender) = nonblocking_unix_pair()?;
+    // Unregistering is unnecessary because EventSource is a singleton
+    #[cfg(feature = "libc")]
+    pipe::register(libc::SIGWINCH, sender)?;
+    #[cfg(not(feature = "libc"))]
+    pipe::register(rustix::process::Signal::Winch as i32, sender)?;
+    Ok(receiver)
+}
+
 impl UnixInternalEventSource {
     pub fn new() -> io::Result<Self> {
-        UnixInternalEventSource::from_file_descriptor(tty_fd()?)
+        UnixInternalEventSource::from_file(tty_file()?, winch_signal_receiver()?)
     }
 
-    pub(crate) fn from_file_descriptor(input_fd: FileDesc<'static>) -> io::Result<Self> {
+    pub(crate) fn from_file(input_file: File, winch_signal_receiver: WinchSignalReceiver) -> io::Result<Self> {
         Ok(UnixInternalEventSource {
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
-            tty: input_fd,
-            winch_signal_receiver: {
-                let (receiver, sender) = nonblocking_unix_pair()?;
-                // Unregistering is unnecessary because EventSource is a singleton
-                #[cfg(feature = "libc")]
-                pipe::register(libc::SIGWINCH, sender)?;
-                #[cfg(not(feature = "libc"))]
-                pipe::register(rustix::process::Signal::Winch as i32, sender)?;
-                receiver
-            },
+            tty: input_file,
+            winch_signal_receiver,
             #[cfg(feature = "event-stream")]
             wake_pipe: WakePipe::new()?,
         })
