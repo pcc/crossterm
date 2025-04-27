@@ -1,5 +1,7 @@
 //! UNIX related logic for terminal manipulation.
 
+use crate::event::source::unix::WinchSignalReceiver;
+use crate::event::EventStream;
 use crate::terminal::WindowSize;
 #[cfg(feature = "libc")]
 use libc::{
@@ -23,6 +25,7 @@ use std::{
 pub struct Terminal {
     file: File,
     prior_mode: Option<Termios>,
+    event_stream: Option<EventStream>,
 }
 
 impl Write for Terminal {
@@ -43,6 +46,7 @@ pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, Terminal>> {
         *terminal = Some(Terminal {
             file: File::options().read(true).write(true).open("/dev/tty")?,
             prior_mode: None,
+            event_stream: None,
         });
     }
     Ok(MutexGuard::map(terminal, |t| t.as_mut().unwrap()))
@@ -53,10 +57,11 @@ pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, Terminal>> {
 static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const_mutex(None);
 
 impl Terminal {
-    pub fn new(file: File) -> Terminal {
+    pub fn new(file: File, winch_signal_receiver: WinchSignalReceiver) -> Terminal {
         Terminal {
-            file,
+            file: file.try_clone().unwrap(),
             prior_mode: None,
+            event_stream: Some(EventStream::with_unix_term(file, winch_signal_receiver)),
         }
     }
 
@@ -145,6 +150,10 @@ impl Terminal {
         }
 
         tput_size().ok_or_else(|| std::io::Error::last_os_error().into())
+    }
+
+    pub fn input_stream(&mut self) -> &mut EventStream {
+        self.event_stream.as_mut().unwrap()
     }
 }
 
