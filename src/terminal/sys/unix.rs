@@ -13,7 +13,7 @@ use rustix::{
     termios::{Termios, Winsize},
 };
 
-use std::{fs::File, io, process};
+use std::{fs::File, io, io::Write, process};
 #[cfg(feature = "libc")]
 use std::{
     mem,
@@ -23,6 +23,16 @@ use std::{
 pub struct Terminal {
     file: File,
     prior_mode: Option<Termios>,
+}
+
+impl Write for Terminal {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 static TERMINAL: Mutex<Option<Terminal>> = parking_lot::const_mutex(None);
@@ -43,13 +53,23 @@ pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, Terminal>> {
 static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const_mutex(None);
 
 impl Terminal {
+    pub fn new(file: File) -> Terminal {
+        Terminal {
+            file,
+            prior_mode: None,
+        }
+    }
+
     pub fn is_raw_mode_enabled(&self) -> bool {
         self.prior_mode.is_some()
     }
 }
 
 pub(crate) fn is_raw_mode_enabled() -> bool {
-    TERMINAL.lock().as_ref().is_some_and(|t| t.is_raw_mode_enabled())
+    TERMINAL
+        .lock()
+        .as_ref()
+        .is_some_and(|t| t.is_raw_mode_enabled())
 }
 
 #[cfg(feature = "libc")]
@@ -113,13 +133,19 @@ impl Terminal {
     }
 }
 
-#[allow(clippy::useless_conversion)]
 pub(crate) fn size() -> io::Result<(u16, u16)> {
-    if let Ok(window_size) = window_size() {
-        return Ok((window_size.columns, window_size.rows));
-    }
+    terminal()?.size()
+}
 
-    tput_size().ok_or_else(|| std::io::Error::last_os_error().into())
+impl Terminal {
+    #[allow(clippy::useless_conversion)]
+    pub fn size(&self) -> io::Result<(u16, u16)> {
+        if let Ok(window_size) = self.window_size() {
+            return Ok((window_size.columns, window_size.rows));
+        }
+
+        tput_size().ok_or_else(|| std::io::Error::last_os_error().into())
+    }
 }
 
 #[cfg(feature = "libc")]
@@ -212,13 +238,16 @@ fn set_terminal_attr(fd: impl AsFd, termios: &Termios) -> io::Result<()> {
 /// [`crossterm::event::read`](crate::event::read) or [`crossterm::event::poll`](crate::event::poll) are being called.
 #[cfg(feature = "events")]
 pub fn supports_keyboard_enhancement() -> io::Result<bool> {
-    use std::ops::DerefMut;
+    terminal()?.supports_keyboard_enhancement()
+}
 
-    let mut terminal = terminal()?;
-    if terminal.is_raw_mode_enabled() {
-        read_supports_keyboard_enhancement_raw(terminal.deref_mut())
-    } else {
-        read_supports_keyboard_enhancement_flags(terminal.deref_mut())
+impl Terminal {
+    pub fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
+        if self.is_raw_mode_enabled() {
+            read_supports_keyboard_enhancement_raw(self)
+        } else {
+            read_supports_keyboard_enhancement_flags(self)
+        }
     }
 }
 
