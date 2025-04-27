@@ -137,6 +137,7 @@ use crate::event::{
 use crate::{csi, Command};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::fmt::{self, Display};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitflags::bitflags;
@@ -276,6 +277,40 @@ where
     F: Filter,
 {
     let mut reader = lock_internal_event_reader();
+    reader.read(filter)
+}
+
+/// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
+pub(crate) fn poll_internal2<F>(
+    event_reader: &mut Arc<Mutex<InternalEventReader>>,
+    timeout: Option<Duration>,
+    filter: &F,
+) -> std::io::Result<bool>
+where
+    F: Filter,
+{
+    let (mut reader, timeout) = if let Some(timeout) = timeout {
+        let poll_timeout = PollTimeout::new(Some(timeout));
+        if let Some(reader) = event_reader.try_lock_for(timeout) {
+            (reader, poll_timeout.leftover())
+        } else {
+            return Ok(false);
+        }
+    } else {
+        (event_reader.lock(), None)
+    };
+    reader.poll(timeout, filter)
+}
+
+/// Reads a single `InternalEvent`.
+pub(crate) fn read_internal2<F>(
+    event_reader: &mut Arc<Mutex<InternalEventReader>>,
+    filter: &F,
+) -> std::io::Result<InternalEvent>
+where
+    F: Filter,
+{
+    let mut reader = event_reader.lock();
     reader.read(filter)
 }
 

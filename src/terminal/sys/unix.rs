@@ -1,7 +1,9 @@
 //! UNIX related logic for terminal manipulation.
 
+use crate::event::filter::CursorPositionFilter;
+use crate::event::read::InternalEventReader;
 use crate::event::source::unix::WinchSignalReceiver;
-use crate::event::EventStream;
+use crate::event::{poll_internal2, read_internal2, EventStream, InternalEvent};
 use crate::terminal::WindowSize;
 #[cfg(feature = "libc")]
 use libc::{
@@ -15,7 +17,14 @@ use rustix::{
     termios::{Termios, Winsize},
 };
 
-use std::{fs::File, io, io::Write, process};
+use std::{
+    fs::File,
+    io,
+    io::{Error, ErrorKind, Write},
+    process,
+    sync::Arc,
+    time::Duration,
+};
 #[cfg(feature = "libc")]
 use std::{
     mem,
@@ -26,6 +35,7 @@ pub struct Terminal {
     file: File,
     prior_mode: Option<Termios>,
     event_stream: Option<EventStream>,
+    event_reader: Option<Arc<Mutex<InternalEventReader>>>,
 }
 
 impl Write for Terminal {
@@ -47,6 +57,7 @@ pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, Terminal>> {
             file: File::options().read(true).write(true).open("/dev/tty")?,
             prior_mode: None,
             event_stream: None,
+            event_reader: None,
         });
     }
     Ok(MutexGuard::map(terminal, |t| t.as_mut().unwrap()))
@@ -58,10 +69,15 @@ static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const
 
 impl Terminal {
     pub fn new(file: File, winch_signal_receiver: WinchSignalReceiver) -> Terminal {
+        let reader = Arc::new(Mutex::new(InternalEventReader::with_unix_term(
+            file.try_clone().unwrap(),
+            winch_signal_receiver,
+        )));
         Terminal {
-            file: file.try_clone().unwrap(),
+            file,
             prior_mode: None,
-            event_stream: Some(EventStream::with_unix_term(file, winch_signal_receiver)),
+            event_stream: Some(EventStream::with_event_reader(reader.clone())),
+            event_reader: Some(reader),
         }
     }
 
@@ -272,7 +288,7 @@ fn read_supports_keyboard_enhancement_flags(terminal: &mut Terminal) -> io::Resu
 fn read_supports_keyboard_enhancement_raw(terminal: &mut Terminal) -> io::Result<bool> {
     use crate::event::{
         filter::{KeyboardEnhancementFlagsFilter, PrimaryDeviceAttributesFilter},
-        poll_internal, read_internal, InternalEvent,
+        poll_internal2, read_internal2, InternalEvent,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -291,16 +307,18 @@ fn read_supports_keyboard_enhancement_raw(terminal: &mut Terminal) -> io::Result
     terminal.file.write_all(QUERY)?;
     terminal.file.flush()?;
 
+    let reader = terminal.event_reader.as_mut().unwrap();
     loop {
-        match poll_internal(
+        match poll_internal2(
+            reader,
             Some(Duration::from_millis(2000)),
             &KeyboardEnhancementFlagsFilter,
         ) {
             Ok(true) => {
-                match read_internal(&KeyboardEnhancementFlagsFilter) {
+                match read_internal2(reader, &KeyboardEnhancementFlagsFilter) {
                     Ok(InternalEvent::KeyboardEnhancementFlags(_current_flags)) => {
                         // Flush the PrimaryDeviceAttributes out of the event queue.
-                        read_internal(&PrimaryDeviceAttributesFilter).ok();
+                        read_internal2(reader, &PrimaryDeviceAttributesFilter).ok();
                         return Ok(true);
                     }
                     _ => return Ok(false),
@@ -373,5 +391,53 @@ fn wrap_with_result(result: i32) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+impl Terminal {
+    pub fn cursor_position(&mut self) -> io::Result<(u16, u16)> {
+        if is_raw_mode_enabled() {
+            self.read_position_raw()
+        } else {
+            self.read_position()
+        }
+    }
+
+    fn read_position(&mut self) -> io::Result<(u16, u16)> {
+        self.enable_raw_mode()?;
+        let pos = self.read_position_raw();
+        self.disable_raw_mode()?;
+        pos
+    }
+
+    fn read_position_raw(&mut self) -> io::Result<(u16, u16)> {
+        // Use `ESC [ 6 n` to and retrieve the cursor position.
+        let mut stdout = io::stdout();
+        stdout.write_all(b"\x1B[6n")?;
+        stdout.flush()?;
+
+        let reader = self.event_reader.as_mut().unwrap();
+        loop {
+            match poll_internal2(
+                reader,
+                Some(Duration::from_millis(2000)),
+                &CursorPositionFilter,
+            ) {
+                Ok(true) => {
+                    if let Ok(InternalEvent::CursorPosition(x, y)) =
+                        read_internal2(reader, &CursorPositionFilter)
+                    {
+                        return Ok((x, y));
+                    }
+                }
+                Ok(false) => {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        "The cursor position could not be read within a normal duration",
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
     }
 }

@@ -1,5 +1,4 @@
 use std::{
-    fs::File,
     io,
     pin::Pin,
     sync::{
@@ -13,12 +12,11 @@ use std::{
 };
 
 use futures_core::stream::Stream;
+use parking_lot::Mutex;
 
 use crate::event::{
-    filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
-    Event, InternalEvent,
-    read::InternalEventReader,
-    source::unix::WinchSignalReceiver,
+    filter::EventFilter, lock_internal_event_reader, poll_internal, poll_internal2,
+    read::InternalEventReader, read_internal2, sys::Waker, Event, InternalEvent,
 };
 
 /// A stream of `Result<Event>`.
@@ -32,27 +30,16 @@ use crate::event::{
 ///
 /// Check the [examples](https://github.com/crossterm-rs/crossterm/tree/master/examples) folder to see how to use
 /// it (`event-stream-*`).
-#[derive(Debug)]
 pub struct EventStream {
     poll_internal_waker: Waker,
     stream_wake_task_executed: Arc<AtomicBool>,
     stream_wake_task_should_shutdown: Arc<AtomicBool>,
     task_sender: SyncSender<Task>,
+    event_reader: Option<Arc<Mutex<InternalEventReader>>>,
 }
 
 impl Default for EventStream {
     fn default() -> Self {
-        EventStream::with_internal_waker(lock_internal_event_reader().waker())
-    }
-}
-
-impl EventStream {
-    /// Constructs a new instance of `EventStream`.
-    pub fn new() -> EventStream {
-        EventStream::default()
-    }
-
-    fn with_internal_waker(waker: Waker) -> Self {
         let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
 
         thread::spawn(move || {
@@ -73,15 +60,51 @@ impl EventStream {
         });
 
         EventStream {
-            poll_internal_waker: waker,
+            poll_internal_waker: lock_internal_event_reader().waker(),
             stream_wake_task_executed: Arc::new(AtomicBool::new(false)),
             stream_wake_task_should_shutdown: Arc::new(AtomicBool::new(false)),
             task_sender,
+            event_reader: None,
+        }
+    }
+}
+
+impl EventStream {
+    pub fn with_event_reader(event_reader: Arc<Mutex<InternalEventReader>>) -> Self {
+        let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
+        let mut event_reader_for_thread = event_reader.clone();
+
+        thread::spawn(move || {
+            while let Ok(task) = receiver.recv() {
+                loop {
+                    if let Ok(true) =
+                        poll_internal2(&mut event_reader_for_thread, None, &EventFilter)
+                    {
+                        break;
+                    }
+
+                    if task.stream_wake_task_should_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                task.stream_wake_task_executed
+                    .store(false, Ordering::SeqCst);
+                task.stream_waker.wake();
+            }
+        });
+
+        EventStream {
+            poll_internal_waker: event_reader.clone().lock().waker(),
+            stream_wake_task_executed: Arc::new(AtomicBool::new(false)),
+            stream_wake_task_should_shutdown: Arc::new(AtomicBool::new(false)),
+            task_sender,
+            event_reader: Some(event_reader),
         }
     }
 
-    pub fn with_unix_term(file: File, winch_signal_receiver: WinchSignalReceiver) -> Self {
-        EventStream::with_internal_waker(InternalEventReader::with_unix_term(file, winch_signal_receiver).waker())
+    /// Constructs a new instance of `EventStream`.
+    pub fn new() -> EventStream {
+        EventStream::default()
     }
 }
 
@@ -113,13 +136,19 @@ impl Stream for EventStream {
     type Item = io::Result<Event>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = match poll_internal(Some(Duration::from_secs(0)), &EventFilter) {
-            Ok(true) => match read_internal(&EventFilter) {
-                Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
-                Err(e) => Poll::Ready(Some(Err(e))),
-                #[cfg(unix)]
-                _ => unreachable!(),
-            },
+        let result = match poll_internal2(
+            self.event_reader.clone().as_mut().unwrap(),
+            Some(Duration::from_secs(0)),
+            &EventFilter,
+        ) {
+            Ok(true) => {
+                match read_internal2(self.event_reader.clone().as_mut().unwrap(), &EventFilter) {
+                    Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
+                    Err(e) => Poll::Ready(Some(Err(e))),
+                    #[cfg(unix)]
+                    _ => unreachable!(),
+                }
+            }
             Ok(false) => {
                 if !self
                     .stream_wake_task_executed
