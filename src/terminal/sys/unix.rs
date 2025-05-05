@@ -20,7 +20,7 @@ use rustix::{
 use std::{
     fs::File,
     io,
-    io::{Error, ErrorKind, Write},
+    io::{BufWriter, Error, ErrorKind, Write},
     process,
     sync::Arc,
     time::Duration,
@@ -32,7 +32,7 @@ use std::{
 };
 
 pub struct Terminal {
-    file: File,
+    file: BufWriter<File>,
     prior_mode: Option<Termios>,
     event_stream: Option<EventStream>,
     event_reader: Option<Arc<Mutex<InternalEventReader>>>,
@@ -54,7 +54,7 @@ pub(crate) fn terminal<'a>() -> io::Result<MappedMutexGuard<'a, Terminal>> {
     let mut terminal = TERMINAL.lock();
     if terminal.is_none() {
         *terminal = Some(Terminal {
-            file: File::options().read(true).write(true).open("/dev/tty")?,
+            file: BufWriter::new(File::options().read(true).write(true).open("/dev/tty")?),
             prior_mode: None,
             event_stream: None,
             event_reader: None,
@@ -74,7 +74,7 @@ impl Terminal {
             winch_signal_receiver,
         )));
         Terminal {
-            file,
+            file: BufWriter::new(file),
             prior_mode: None,
             event_stream: Some(EventStream::with_event_reader(reader.clone())),
             event_reader: Some(reader),
@@ -149,7 +149,7 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
 
 impl Terminal {
     pub fn window_size(&self) -> io::Result<WindowSize> {
-        let size = rustix::termios::tcgetwinsize(&self.file)?;
+        let size = rustix::termios::tcgetwinsize(&self.file.get_ref())?;
         Ok(size.into())
     }
 }
@@ -202,10 +202,10 @@ impl Terminal {
             return Ok(());
         }
 
-        let mut ios = get_terminal_attr(&self.file.as_fd())?;
+        let mut ios = get_terminal_attr(&self.file.get_ref().as_fd())?;
         let original_mode_ios = ios.clone();
         ios.make_raw();
-        set_terminal_attr(&self.file.as_fd(), &ios)?;
+        set_terminal_attr(&self.file.get_ref().as_fd(), &ios)?;
         // Keep it last - set the original mode only if we were able to switch to the raw mode
         self.prior_mode = Some(original_mode_ios);
         Ok(())
@@ -237,7 +237,7 @@ pub(crate) fn disable_raw_mode() -> io::Result<()> {
 impl Terminal {
     pub fn disable_raw_mode(&mut self) -> io::Result<()> {
         if let Some(original_mode_ios) = self.prior_mode.as_ref() {
-            set_terminal_attr(&self.file.as_fd(), original_mode_ios)?;
+            set_terminal_attr(&self.file.get_ref().as_fd(), original_mode_ios)?;
             // Keep it last - remove the original mode only if we were able to switch back
             self.prior_mode = None;
         }
