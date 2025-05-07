@@ -171,6 +171,10 @@ impl Terminal {
     pub fn input_stream(&mut self) -> &mut EventStream {
         self.event_stream.as_mut().unwrap()
     }
+
+    pub fn take_input_stream(&mut self) -> EventStream {
+        self.event_stream.take().unwrap()
+    }
 }
 
 #[cfg(feature = "libc")]
